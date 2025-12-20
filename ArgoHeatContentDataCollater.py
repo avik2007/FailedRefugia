@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import argopy
-from argopy import DataFetcher
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -9,7 +8,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import gsw
 from datetime import datetime   
-
+from argopy import DataFetcher as ArgoDataFetcher
 
 def calculate_thermodynamics(sp, t, p, lon, lat):
     """
@@ -121,97 +120,178 @@ def make_spatially_weighted_timeseries(da_ohc):
     
     return regional_means
 
-def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds):
+def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds, depth_bounds=[0, 200]):
     """
-    Loads Argo data preserving Time and Float ID for LOFO & Spatio-Temporal analysis.
+    Fetches Argo data directly from Erddap (Always), processes it, and saves the dataframe with a descriptive filename.
     
     Args:
-        nc_dir (str): Path to folder containing Argo NetCDF files.
-        start_date, end_date (str): 'YYYY-MM-DD' range.
-        lat_bounds, lon_bounds (list): [min, max] for spatial cropping.
+        nc_dir (str): Directory where the processed DataFrame will be saved.
+        start_date, end_date (str): 'YYYY-MM-DD'.
+        lat_bounds, lon_bounds (list): [min, max].
+        depth_bounds (list): [min, max] in meters.
         
     Returns:
-        pd.DataFrame: Columns [lat, lon, temp, time_days, float_id, date]
+        pd.DataFrame: Cleaned data [lat, lon, temp, depth, time_days, float_id, date]
     """
+    # 1. SETUP
+    ref_date = pd.to_datetime(start_date)
+    os.makedirs(nc_dir, exist_ok=True)
+    
+    # GENERATE DESCRIPTIVE FILENAME
+    # Format: argo_START_END_latMIN-MAX_lonMIN-MAX_zMIN-MAX.pkl
+    fname = (f"argo_{start_date}_to_{end_date}_"
+             f"lat{lat_bounds[0]}_{lat_bounds[1]}_"
+             f"lon{lon_bounds[0]}_{lon_bounds[1]}_"
+             f"z{depth_bounds[0]}_{depth_bounds[1]}.pkl")
+             
+    save_path = os.path.join(nc_dir, fname)
+
+    # 2. FETCH DATA (Always)
+    print(f"\n🌊 INITIATING ARGO FETCH (Source: Erddap)")
+    print(f"   Target: {start_date} to {end_date}")
+    print(f"   Region: Lat {lat_bounds} | Lon {lon_bounds}")
+    print(f"   Depth:  {depth_bounds[0]}m to {depth_bounds[1]}m")
+    print(f"   Save Path: {save_path}")
+    
+    try:
+        fetcher = ArgoDataFetcher(src='erddap').region(
+            [lon_bounds[0], lon_bounds[1], 
+             lat_bounds[0], lat_bounds[1], 
+             depth_bounds[0], depth_bounds[1], 
+             start_date, end_date]
+        )
+        ds = fetcher.to_xarray()
+        print(f"   ✅ Data received from server.")
+    except Exception as e:
+        print(f"   ❌ FETCH FAILED: {e}")
+        return pd.DataFrame()
+
+    # 3. PROCESS DATA
+    print(f"   🔄 Processing profiles...")
     all_rows = []
     
-    # Reference date for continuous time (e.g., Days since Start)
-    ref_date = pd.to_datetime(start_date)
-
-    print(f"📂 Scanning {nc_dir} for floats ({start_date} to {end_date})...")
+    # Identify variables
+    t_var = 'TEMP_ADJUSTED' if 'TEMP_ADJUSTED' in ds else 'TEMP'
+    p_var = 'PRES_ADJUSTED' if 'PRES_ADJUSTED' in ds else 'PRES'
     
-    for filename in os.listdir(nc_dir):
-        if not filename.endswith(".nc"): continue
-        filepath = os.path.join(nc_dir, filename)
-        
-        try:
-            ds = xr.open_dataset(filepath)
-            
-            # --- 1. SPATIAL SUBSET (Fast Filter) ---
-            mask_space = (
-                (ds.LATITUDE >= lat_bounds[0]) & (ds.LATITUDE <= lat_bounds[1]) &
-                (ds.LONGITUDE >= lon_bounds[0]) & (ds.LONGITUDE <= lon_bounds[1])
-            )
-            if not mask_space.any():
-                ds.close(); continue
-            
-            ds_subset = ds.where(mask_space, drop=True)
-            
-            # --- 2. TEMPORAL SUBSET ---
-            ds_subset = ds_subset.sel(TIME=slice(start_date, end_date))
-            if len(ds_subset.TIME) == 0:
-                ds.close(); continue
+    if t_var not in ds:
+        print("   ❌ No Temperature variable found.")
+        return pd.DataFrame()
 
-            # --- 3. EXTRACT METADATA (ID) ---
-            # Try to get ID from attribute or filename
+    # Extract arrays
+    lats = ds.LATITUDE.values
+    lons = ds.LONGITUDE.values
+    times = ds.TIME.values
+    temps = ds[t_var].values
+    
+    has_depth = p_var in ds
+    if has_depth: pressures = ds[p_var].values
+    
+    # --- HANDLING DATA DIMENSIONS ---
+    # Case A: Profile Mode (2D)
+    if temps.ndim == 2:
+        num_profiles = temps.shape[0]
+        for p in range(num_profiles):
+            lat_p = lats[p]
+            lon_p = lons[p]
+            time_p = times[p]
+            
+            if lon_p > 180: lon_p -= 360
+            if not (lat_bounds[0] <= lat_p <= lat_bounds[1]): continue
+            if not (lon_bounds[0] <= lon_p <= lon_bounds[1]): continue
+            if pd.isnull(time_p): continue
+            
+            # Vertical Search
+            profile_temps = temps[p, :]
+            
+            if has_depth:
+                profile_pres = pressures[p, :]
+                valid_mask = (
+                    (profile_pres >= depth_bounds[0]) & 
+                    (profile_pres <= depth_bounds[1]) & 
+                    (~np.isnan(profile_temps))
+                )
+                valid_indices = np.where(valid_mask)[0]
+            else:
+                valid_indices = np.where(~np.isnan(profile_temps))[0]
+            
+            if len(valid_indices) == 0: continue 
+            
+            # Take shallowest valid
+            best_idx = valid_indices[0] 
+            t_val = profile_temps[best_idx]
+            depth_val = profile_pres[best_idx] if has_depth else np.nan
+            
+            # ID
             try:
-                # Often stored as byte string in PLATFORM_NUMBER
-                raw_id = ds_subset.PLATFORM_NUMBER.values[0]
-                if isinstance(raw_id, bytes):
-                    float_id = raw_id.decode('utf-8').strip()
-                else:
-                    float_id = str(raw_id).strip()
-            except:
-                float_id = filename.split("_")[0] # Fallback to filename
+                if 'PLATFORM_NUMBER' in ds:
+                    raw_id = ds.PLATFORM_NUMBER.values[p]
+                    if isinstance(raw_id, bytes): f_id = raw_id.decode('utf-8').strip()
+                    else: f_id = str(raw_id).strip()
+                else: f_id = "unknown"
+            except: f_id = "unknown"
 
-            # --- 4. EXTRACT DATA ---
-            # Prefer Adjusted Temp, fall back to Raw Temp
-            t_var = 'TEMP_ADJUSTED' if 'TEMP_ADJUSTED' in ds_subset else 'TEMP'
+            dt = pd.to_datetime(time_p)
+            days_delta = (dt - ref_date).total_seconds() / 86400.0
             
-            lats = ds_subset.LATITUDE.values
-            lons = ds_subset.LONGITUDE.values
-            times = ds_subset.TIME.values
-            temps = ds_subset[t_var].values
+            all_rows.append({
+                'lat': float(lat_p),
+                'lon': float(lon_p),
+                'temp': float(t_val),
+                'depth': float(depth_val),
+                'time_days': float(days_delta),
+                'float_id': f_id,
+                'date': dt
+            })
+
+    # Case B: Point Mode (1D)
+    elif temps.ndim == 1:
+        for i in range(len(temps)):
+            lat_p = lats[i]
+            lon_p = lons[i]
+            if lon_p > 180: lon_p -= 360
             
-            # Handle Depth: If data has depth dim, take surface (index 0)
-            if temps.ndim > 1:
-                temps = temps[:, 0]
-
-            for i in range(len(temps)):
-                t_val = temps[i]
-                if np.isnan(t_val): continue
-                
-                # Convert Timestamp to "Days since Start"
-                dt = pd.to_datetime(times[i])
-                days_delta = (dt - ref_date).total_seconds() / 86400.0
-                
-                all_rows.append({
-                    'lat': float(lats[i]),
-                    'lon': float(lons[i]),
-                    'temp': float(t_val),
-                    'time_days': float(days_delta), # Continuous variable for GP
-                    'float_id': float_id,           # Grouping variable for LOFO
-                    'date': dt                      # Human readable for debugging
-                })
+            if not (lat_bounds[0] <= lat_p <= lat_bounds[1]): continue
+            if not (lon_bounds[0] <= lon_p <= lon_bounds[1]): continue
             
-            ds.close()
+            t_val = temps[i]
+            if np.isnan(t_val): continue
+            
+            depth_val = np.nan
+            if has_depth:
+                p_val = pressures[i]
+                if np.isnan(p_val) or not (depth_bounds[0] <= p_val <= depth_bounds[1]):
+                    continue
+                depth_val = p_val
+            
+            dt = pd.to_datetime(times[i])
+            days_delta = (dt - ref_date).total_seconds() / 86400.0
+            
+            try:
+                raw_id = ds.PLATFORM_NUMBER.values[i]
+                if isinstance(raw_id, bytes): f_id = raw_id.decode('utf-8').strip()
+                else: f_id = str(raw_id).strip()
+            except: f_id = "unknown"
 
-        except Exception as e:
-            continue
+            all_rows.append({
+                'lat': float(lat_p),
+                'lon': float(lon_p),
+                'temp': float(t_val),
+                'depth': float(depth_val),
+                'time_days': float(days_delta),
+                'float_id': f_id,
+                'date': dt
+            })
 
+    # 4. SAVE & RETURN
     df = pd.DataFrame(all_rows)
-    print(f"✅ LOAD COMPLETE:")
-    print(f"   - Observations: {len(df)}")
-    print(f"   - Unique Floats: {df['float_id'].nunique()}")
-    print(f"   - Time Span: {df['time_days'].min():.1f} to {df['time_days'].max():.1f} days")
+    print(f"✅ COMPLETE: Loaded {len(df)} valid observations.")
+    
+    if not df.empty:
+        try:
+            df.to_pickle(save_path)
+            print(f"   💾 DataFrame saved to: {save_path}")
+        except Exception as e:
+            print(f"   ⚠️ Save failed: {e}")
+            
     return df
