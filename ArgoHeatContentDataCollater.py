@@ -119,9 +119,7 @@ def make_spatially_weighted_timeseries(da_ohc):
     regional_means.index = regional_means.index.to_timestamp()
     
     return regional_means
-
-def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds, depth_bounds=[0, 200]):
-    """
+"""
     Fetches Argo data. Checks local cache first; if missing, downloads from Erddap and saves.
     
     Args:
@@ -133,6 +131,8 @@ def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds
     Returns:
         pd.DataFrame: Cleaned data [lat, lon, temp, depth, time_days, float_id, date]
     """
+def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds, depth_bounds=[0, 200]):
+    
     # 1. SETUP & FILENAME GENERATION
     ref_date = pd.to_datetime(start_date)
     os.makedirs(nc_dir, exist_ok=True)
@@ -305,3 +305,123 @@ def load_argo_data_advanced(nc_dir, start_date, end_date, lat_bounds, lon_bounds
             print(f"   ⚠️ Save failed: {e}")
             
     return df
+
+
+
+"""
+    Calculates OHC by pooling ALL raw data in a Lat/Lon/Time box into one 
+    'Synthetic Profile' and integrating it. DESIGNED TO TAKE INPUTS FROM
+    load_argo_data_advanced().
+    
+    STRATEGY:
+    1. Binning: Assign every raw measurement (from any float) to a 3D Bin.
+    2. Thermodynamics: Calculate Energy Density (J/m^3) for every point.
+    3. Vertical Interpolation: Average the energy density into standard vertical steps (e.g. every 10m).
+    4. Integration: Integrate the vertical profile to get OHC (J/m^2).
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Must contain 'lat', 'lon', 'time_days', 'pres', 'temp', 'psal'.
+    vertical_step : int
+        The vertical resolution (in meters) to smooth the pooled data before integrating.
+        Default is 10m (standard for OHC).
+    min_coverage_pct : float
+        Percentage of vertical bins that must have data. If a bin has a huge gap 
+        (e.g., data at 0m and 1000m only), returns NaN.
+        
+    Returns:
+    --------
+    df_binned : pd.DataFrame
+        One row per Lat/Lon/Time bin with 'ohc', 'n_points', etc.
+    """
+
+def estimate_ohc_from_raw_bins(df, 
+                               resolution_lat=1.0, 
+                               resolution_lon=1.0, 
+                               resolution_time_days=30,
+                               depth_min=0, 
+                               depth_max=2000,
+                               vertical_step=10, # Vertical resolution for integration (m)
+                               min_coverage_pct=0.7):
+    
+    
+    print(f"📦 BINNING RAW DATA: {resolution_lat}° x {resolution_lon}° x {resolution_time_days} days...")
+    
+    # --- STEP 1: CALCULATE THERMODYNAMICS (PER POINT) ---
+    # We do this globally first because it's vectorized (fast)
+    work_df = df.copy()
+    
+    # GSW Calculations (TEOS-10 Standard)
+    # 1. Absolute Salinity
+    work_df['SA'] = gsw.SA_from_SP(work_df['psal'].values, work_df['pres'].values, 
+                                   work_df['lon'].values, work_df['lat'].values)
+    # 2. Conservative Temperature
+    work_df['CT'] = gsw.CT_from_t(work_df['SA'].values, work_df['temp'].values, work_df['pres'].values)
+    
+    # 3. Density & Specific Heat
+    rho = gsw.rho(work_df['SA'].values, work_df['CT'].values, work_df['pres'].values)
+    cp = gsw.cp_t_exact(work_df['SA'].values, work_df['temp'].values, work_df['pres'].values)
+    
+    # 4. Energy Density (Joules / m^3)
+    # This represents how much heat is in a 1m cube of water at this point
+    # We assume 0 deg C as the reference for 'Heat Content' (standard in oceanography)
+    work_df['energy_density'] = rho * cp * work_df['CT']
+    
+    # --- STEP 2: ASSIGN SPATIAL BINS ---
+    # We use simple rounding to create grid IDs
+    work_df['lat_bin'] = (work_df['lat'] // resolution_lat) * resolution_lat + (resolution_lat/2)
+    work_df['lon_bin'] = (work_df['lon'] // resolution_lon) * resolution_lon + (resolution_lon/2)
+    work_df['time_bin'] = (work_df['time_days'] // resolution_time_days) * resolution_time_days
+    
+    # --- STEP 3: THE AGGREGATION FUNCTION ---
+    # This runs once for every 3D box
+    def integrate_bin(group):
+        # 1. Define Standard Vertical Grid for this Layer
+        z_grid = np.arange(depth_min, depth_max + vertical_step, vertical_step)
+        
+        # 2. Assign each raw point to a vertical level
+        # This handles the "cloud" of points from different floats
+        group['z_idx'] = np.digitize(group['pres'], z_grid)
+        
+        # 3. Calculate Mean Energy Density per vertical level
+        # This collapses the multiple floats into one "Synthetic Profile"
+        profile_means = group.groupby('z_idx')['energy_density'].mean()
+        
+        # 4. Reindex to the full grid (fills gaps with NaN)
+        # We need indices 1 to len(z_grid)
+        full_profile = profile_means.reindex(range(1, len(z_grid)), fill_value=np.nan)
+        
+        # 5. Robustness: Check for Gaps
+        # If we are missing too much of the water column, don't guess.
+        valid_fraction = full_profile.notna().mean()
+        if valid_fraction < min_coverage_pct:
+            return np.nan
+        
+        # 6. Interpolate small gaps (e.g., if missing 10-20m but have 0m and 30m)
+        full_profile_interp = full_profile.interpolate(method='linear', limit_direction='both')
+        
+        # 7. Integrate (Trapezoidal Rule)
+        # OHC = Integral( Energy_Density * dz )
+        ohc = np.trapz(full_profile_interp.values, dx=vertical_step)
+        
+        return ohc
+
+    # --- STEP 4: EXECUTE ---
+    print(f"   ... Grouping and Integrating (Layer: {depth_min}-{depth_max}m)...")
+    
+    # Group by the bins and apply the custom integration
+    # Note: This step can take a moment if you have thousands of bins
+    results = work_df.groupby(['time_bin', 'lat_bin', 'lon_bin']).apply(
+        integrate_bin, include_groups=False
+    ).reset_index(name='ohc')
+    
+    # Add counts for metadata
+    counts = work_df.groupby(['time_bin', 'lat_bin', 'lon_bin']).size().reset_index(name='n_raw_points')
+    results = pd.merge(results, counts, on=['time_bin', 'lat_bin', 'lon_bin'])
+    
+    # Remove bins that failed the robustness check
+    results = results.dropna(subset=['ohc'])
+    
+    print(f"✅ DONE. Generated {len(results)} valid bin estimates.")
+    return results

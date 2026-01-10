@@ -87,7 +87,17 @@ def generalized_cross_validation(df, feature_cols=['lat', 'lon'], target_col='te
     ---------------------------------------------------------------------------
     """
     print(f"\n🚀 STARTING GLOBAL VALIDATION: {method}")
-    
+
+    # --- SAFETY CHECK: DIMENSION MISMATCH ---
+    if not auto_tune:
+        # Check if length_scale_val is a list/array (Anisotropic)
+        if hasattr(length_scale_val, '__len__') and not isinstance(length_scale_val, (str, float, int)):
+            if len(length_scale_val) != len(feature_cols):
+                raise ValueError(
+                    f"\n❌ CONFIG ERROR: You provided {len(feature_cols)} feature columns {feature_cols}, "
+                    f"but a length_scale_val list of size {len(length_scale_val)}: {length_scale_val}.\n"
+                    f"👉 Please provide exactly one length scale per feature, or a single float for isotropic mode."
+                )
     # 1. SETUP & SCALING
     X = df[feature_cols].values
     y = df[target_col].values
@@ -111,8 +121,13 @@ def generalized_cross_validation(df, feature_cols=['lat', 'lon'], target_col='te
     
     if auto_tune:
         N_points = len(X_scaled)
-        n_sub = int(N_points * tune_subsample_frac)
-        n_sub = max(100, min(n_sub, 2000))
+
+        target_n = int(N_points * tune_subsample_frac)
+
+        if N_points < 100:
+            n_sub = N_points
+        else:
+            n_sub = max(100, min(target_n, 2000))
         
         # Calculate Guardrails (Bounds)
         data_span = np.max(X_scaled, axis=0) - np.min(X_scaled, axis=0)
@@ -168,13 +183,16 @@ def generalized_cross_validation(df, feature_cols=['lat', 'lon'], target_col='te
     # 3. CHOOSE SPLITTER
     if method == 'LOFO':
         cv = LeaveOneGroupOut()
-    elif method == 'KFold':
+    #("LOOO" is not the technically accurate name for the method, but I mix it up sometimes with KFolding.)
+    elif (method == 'KFold' or method=='LOOO'): 
         n_splits = int(100 / k_fold_data_percent)
         if n_splits < 2: n_splits = 2
         if n_splits >= len(df): n_splits = len(df)
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         print(f"   ⚡ Strategy: {n_splits}-Fold CV (Testing {k_fold_data_percent}% per fold)")
-
+    else:
+        raise ValueError(f"Unknown method '{method}'. Please use 'LOFO' or 'KFold'.")
+    
     # 4. RUN LOOP
     y_preds = []
     y_true = []
@@ -236,13 +254,21 @@ def generalized_cross_validation(df, feature_cols=['lat', 'lon'], target_col='te
     print(f"   Mean Z:              {np.mean(z_scores):.3f}")
     print(f"   Std Z:               {np.std(z_scores):.3f} (Ideal: 1.0)")
     
-    return z_scores
+    return {
+        "z_scores": z_scores,
+        "rmse": rmse,
+        "best_length_scale": final_length_scale, # The winner (Auto or Manual)
+        "best_noise": final_noise                # The winner (Auto or Manual)
+    }
 
 
 
 
 
-
+"""
+This is almost certaintly the best thing to use, but it is computationally incredibly costly because you study space and
+time varying correlation distances. Save this for cloud computing.
+"""
 
 def validate_moving_window(df, feature_cols=['lat', 'lon'], target_col='temp', 
                            method='LOFO', k_fold_data_percent=10,
@@ -555,3 +581,216 @@ def validate_moving_window(df, feature_cols=['lat', 'lon'], target_col='temp',
     print(f"   Std Z:               {np.std(z_scores):.3f}")
     
     return z_scores
+
+
+
+    """
+    PHASE 3: PRODUCTION MAPPER (The Generator).
+    
+    Generates a continuous Gridded Map (NetCDF/Xarray) from sparse Argo data
+    using the "Fixed Kernel" parameters tuned in the Validation phase.
+    
+    -------------------------------------------------------------------------
+    STRATEGY: "Integrate First, Map Second"
+    -------------------------------------------------------------------------
+    Instead of 4D Kriging (Lat, Lon, Depth, Time), we rely on the user passing
+    pre-integrated layers (e.g., 'ohc_source'). This allows us to map each 
+    physical layer with its own unique correlation length (e.g., Surface = Chaotic, 
+    Deep = Smooth).
+    
+    PARAMETERS:
+    -----------
+    df : pd.DataFrame
+        Input data. MUST contain:
+        - 'lat', 'lon' : Spatial coordinates (degrees).
+        - 'time_days'  : Numeric time (e.g., days since start).
+        - target_col   : The variable to interpolate (e.g., 'ohc_source').
+        
+    grid_lat, grid_lon : 1D arrays
+        The spatial mesh you want to produce (e.g., np.arange(30, 40, 0.5)).
+        
+    grid_time : 1D array
+        The time steps you want to produce (must match units of 'time_days').
+        
+    target_col : str
+        The specific column in 'df' to map (e.g. 'ohc_response').
+        
+    radius_km : float
+        The "Horizon" of the model. Points further than this are ignored 
+        to save compute time. (Standard: ~300km).
+        
+    final_length_scale : float or array-like
+        The physical correlation length (in SIGMAS) you found during validation.
+        Can be a scalar (isotropic) or an array matching dimensions (anisotropic).
+        
+    final_noise : float
+        The noise floor (uncertainty) you found during validation.
+        (e.g., 0.1).
+        
+    is_3d : bool
+        If True, includes 'time_days' in the distance calculation.
+        
+    time_buffer: int
+        Number of days we are including in each time data point in our trend. Basically a time_buffer number of days
+        will be combined to make a monthly map for us to study trends. This buffer smooths out our kriged fields. If
+        you set this number too small, any time a float enters the window, there will be a sharp spike in the field
+        and in the uncertainty. Too large and you're wasting computational power. We are expecting long correlation times
+        for climate scale behavior, so the default is 60 days
+    RETURNS:
+    --------
+    xr.Dataset
+        A 3D Xarray (Time, Lat, Lon) containing:
+        - 'temp' (Prediction)
+        - 'uncertainty' (Standard Deviation / Error Bars)
+    """
+
+def produce_kriging_map(df, 
+                        grid_lat, grid_lon, grid_time,
+                        target_col='temp',
+                        radius_km=300, min_neighbors=5,
+                        final_length_scale=1.0, final_noise=0.1,
+                        is_3d=True, time_buffer = 60):
+   
+    
+    # ---------------------------------------------------------
+    # 1. SETUP & SCALING
+    # ---------------------------------------------------------
+    # We must scale inputs so Lat (deg), Lon (deg), and Time (days) 
+    # are treated equally by the isotropic kernel.
+    feature_cols = ['lat', 'lon', 'time_days'] if is_3d else ['lat', 'lon']
+    
+    print(f"\n🗺️ STARTING PRODUCTION MAPPING for '{target_col}'...")
+    if np.ndim(final_length_scale) == 0:
+        print(f"   Using Kernel: Length={final_length_scale:.3f} (Sigmas), Noise={final_noise:.3f}")
+    else:
+        print(f"   Using Kernel: Length={final_length_scale} (Sigmas), Noise={final_noise:.3f}")
+    
+    X = df[feature_cols].values
+    y = df[target_col].values
+    
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    # Fit the scaler on ALL data to establish the global coordinate system
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+    
+    # Pre-calculate radians for Lat/Lon to use fast Haversine distance later
+    # (Only needed for the spatial dimensions 0 and 1)
+    X_rad_space = np.radians(X[:, :2]) 
+    radius_rad = radius_km / 6371.0  # Convert km to Earth Radians
+    
+    # ---------------------------------------------------------
+    # 2. DEFINE THE PHYSICS (THE KERNEL)
+    # ---------------------------------------------------------
+    # We use a FIXED kernel. We do NOT optimize (fit) inside the loop.
+    # The parameters (length_scale, noise) are hard-coded from your Validation results.
+    # optimizer=None ensures the model doesn't try to "re-learn" physics at every pixel.
+    k = ConstantKernel(1.0, "fixed") * \
+        RBF(length_scale=final_length_scale, length_scale_bounds="fixed") + \
+        WhiteKernel(noise_level=final_noise, noise_level_bounds="fixed")
+    
+    # ---------------------------------------------------------
+    # 3. PREPARE THE OUTPUT GRID
+    # ---------------------------------------------------------
+    shape = (len(grid_time), len(grid_lat), len(grid_lon))
+    map_mean = np.full(shape, np.nan) # The Prediction Map
+    map_std = np.full(shape, np.nan)  # The Uncertainty Map
+    
+    total_slices = len(grid_time)
+    
+    # ---------------------------------------------------------
+    # 4. THE MAIN LOOP (Time -> Space)
+    # ---------------------------------------------------------
+    for t_i, t_val in enumerate(grid_time):
+        
+        # --- OPTIMIZATION A: TEMPORAL FILTER ---
+        # Instead of searching the entire dataset for every pixel, 
+        # we first grab only floats that exist near this time step.
+        # This reduces the matrix size from N=10,000 to N=200, making it fast.
+        
+        if is_3d:
+            # We filter for data within +/- 60 days (default) (2 months) of the target date.
+            # Why 60? It's a safe buffer. The kernel (length_scale) will naturally 
+            # downweight points far away in time, but we hard-cut them here for speed.
+            time_col_idx = 2
+            # Note: We must look at RAW time (X[:,2]) not scaled X_scaled yet
+            time_mask = np.abs(X[:, time_col_idx] - t_val) < time_buffer
+            
+            # If no data exists in this window, skip the whole month (leave as NaNs)
+            if np.sum(time_mask) < min_neighbors:
+                print(f"   Skipping Slice {t_i+1}/{total_slices} (Not enough data)...", end='\r')
+                continue
+                
+            X_subset = X_scaled[time_mask]
+            y_subset = y_scaled[time_mask]
+            X_rad_subset = X_rad_space[time_mask]
+        else:
+            # 2D Mode: Use all data (Climatology)
+            X_subset = X_scaled
+            y_subset = y_scaled
+            X_rad_subset = X_rad_space
+
+        # Loop through Space (Lat/Lon)
+        for lat_i, lat_val in enumerate(grid_lat):
+            for lon_i, lon_val in enumerate(grid_lon):
+                
+                # --- OPTIMIZATION B: SPATIAL FILTER ---
+                # Use Haversine distance to find neighbors within radius_km
+                target_rad = np.radians([[lat_val, lon_val]])
+                dists = haversine_distances(X_rad_subset, target_rad).flatten()
+                
+                # Create the local neighborhood mask
+                mask = dists < radius_rad
+                
+                # If this pixel is in a "Void" (no nearby floats), leave it as NaN.
+                # This explicitly identifies the "Observationally Opaque" regions.
+                if np.sum(mask) < min_neighbors: continue
+                
+                # --- THE KRIGING STEP ---
+                # 1. Prepare Target Point (Lat, Lon, Time) scaled to global norms
+                coords = [lat_val, lon_val, t_val] if is_3d else [lat_val, lon_val]
+                target_scaled = scaler_X.transform([coords])
+                
+                # 2. Instantiate GP with FIXED Physics
+                gp = GaussianProcessRegressor(kernel=k, optimizer=None, alpha=0.0)
+                
+                # 3. Fit ONLY to the local neighborhood (Subset of Subset)
+                gp.fit(X_subset[mask], y_subset[mask])
+                
+                # 4. Predict
+                pred, std = gp.predict(target_scaled, return_std=True)
+                
+                # 5. Inverse Transform (Back to real units: Joules or Deg C)
+                # Note: We must handle scaler shapes carefully
+                map_mean[t_i, lat_i, lon_i] = scaler_y.inverse_transform([[pred[0]]])[0][0]
+                
+                # Uncertainty scales linearly, so we multiply by the scaler's scale factor
+                map_std[t_i, lat_i, lon_i] = std[0] * scaler_y.scale_[0]
+        
+        # Progress Bar
+        print(f"   Mapped Slice {t_i+1}/{total_slices} (Time={t_val:.0f})...", end='\r')
+
+    print("\n✅ Mapping Complete.")
+    
+    # ---------------------------------------------------------
+    # 5. EXPORT TO XARRAY
+    # ---------------------------------------------------------
+    # We package the 3D numpy arrays into a labelled Data Cube
+    return xr.Dataset(
+        data_vars={
+            target_col: (["time", "lat", "lon"], map_mean),
+            f"{target_col}_uncert": (["time", "lat", "lon"], map_std)
+        },
+        coords={
+            "time": grid_time,
+            "lat": grid_lat,
+            "lon": grid_lon
+        },
+        attrs={
+            "description": f"Kriged Map of {target_col}",
+            "kernel_length_scale": final_length_scale,
+            "kernel_noise": final_noise,
+            "units": "Joules/m^2" if "ohc" in target_col else "degC"
+        }
+    )
